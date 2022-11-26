@@ -1,0 +1,19 @@
+---
+title: "amazon-reviews"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{amazon-reviews}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(sparse.group.slope)
+```
