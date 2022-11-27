@@ -8,14 +8,16 @@ df <- farff::readARFF("./data/amazon_reviews/cleanedAmazon.arff")
 X <- df[-ncol(df)]
 X <- sweep(X, 2, sqrt(colSums(X^2)), "/")
 X <- as(as.matrix(X), "dgCMatrix")
-y <- (df[ncol(df)])$class
+y <- df[,ncol(df)]
 
 
-cl <- parallel::makeCluster(8)
+cl <- parallel::makeCluster(5)
 doParallel::registerDoParallel(cl)
 # Do 4-fold cross validation on a lambda sequence of length 100.
 # The sequence is decreasing from the data derived lambda.max to 0.2*lambda.max
-fit.cv <- msgl::cv(as.matrix(X), y, fold = 10, lambda = 1e-4, d=100, use_parallel = FALSE, standardize = F)
+
+fit.cv <- msgl::cv(X, y, fold = 10, lambda = 1e-4, d=100, use_parallel = T, standardize = T, )
+
 parallel::stopCluster(cl)
 # Print information about models
 # and cross validation errors (estimated expected generalization error)
@@ -33,7 +35,7 @@ fold.size <- ceiling(n/folds)
 As <- seq(0.01, 0.001, -0.001)
 cvs <- rep(0, length(As))
 all_results <- list()
-#Binits <- as.list(rep(0, folds))
+Binits <- as.list(rep(0, folds))
 
 for (j in 1:length(As)) {
   A <- As[j]
@@ -42,7 +44,8 @@ for (j in 1:length(As)) {
   alpha <- A*sapply(1:L, function(j)(sqrt(log(L*exp(1)/j)/n)))
 
   fold <- function(i){
-    test.group <- fit.cv$cv.indices[[i]]
+    #test.group <- fit.cv$cv.indices[[i]]
+    test.group <- idx[(i*fold.size+1):((i+1)*fold.size+1)]
     model <- sparse.group.slope::SparseGroupSLOPE(
       X=X[-test.group,], y=diag(L)[y[-test.group],], eta=0.9, tol = 1e-5, 
       monotone=F, accelerated=T, lambda = lambda, alpha = alpha, BInit = Binits[[i]], #B
