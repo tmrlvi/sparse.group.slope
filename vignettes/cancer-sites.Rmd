@@ -1,19 +1,125 @@
 ---
-title: "cancer-sites"
+title: "Cancer Sites"
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{cancer-sites}
+  %\VignetteIndexEntry{simulation}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---
 
 ```{r, include = FALSE}
+library(GEOquery)
+library(dplyr)
+library(stringr)
 knitr::opts_chunk$set(
   collapse = TRUE,
   comment = "#>"
 )
 ```
 
-```{r setup}
+# Process Data
+
+```{r}
+gse <- getGEO("GSE2564",GSEMatrix=TRUE)
+```
+
+```{r}
+usedFeatures <- featureData(gse[[1]])$USAGE == "Used"
+usedSampled <- phenoData(gse[[1]])$organism_ch1 == "Homo sapiens"
+limited <- gse[[1]][usedFeatures,usedSampled]
+
+classes <- pData(phenoData(limited)) %>% 
+  mutate(class=str_extract(title, "[^_]+_[^_]+")) %>% 
+  group_by(class) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  mutate(tumor_or_normal=str_starts(class, "T_") | str_starts(class, "N_")) %>%
+  select(geo_accession, class, count, tumor_or_normal)
+  
+selected <- gse[[1]][, classes$geo_accession[(classes$count >= 5) & classes$tumor_or_normal]]
+
+X <- t(exprs(selected))
+X <- X[,!apply((X == 0), 2, all)]
+y <- as.factor((pData(phenoData(selected)) %>% 
+  mutate(class=str_extract(title, "[^_]+_[^_]+")) %>% 
+  select(class))$class)
+```
+
+# Sparse Group Lasso
+```{r}
+library(msgl)
+data(PrimaryCancers)
+X <- x
+y <- classes
+```
+
+```{r}
+indices <- fit.cv$cv.indices
+```
+
+```{r}
+#Do cross validation using 2 parallel units
+cl <- parallel::makeCluster(5)
+doParallel::registerDoParallel(cl)
+# Do 4-fold cross validation on a lambda sequence of length 100.
+# The sequence is decreasing from the data derived lambda.max to 0.2*lambda.max
+for (w in seq(0., 0.2, 0.01)) {
+  fit.cv <- msgl::cv(X, y, fold = 10, lambda = 0.01, alpha=w, use_parallel = TRUE, standardize = TRUE, cv.indices = indices)
+  print(paste(w, min(Err(fit.cv))))
+}
+parallel::stopCluster(cl)
+# Print information about models
+# and cross validation errors (estimated expected generalization error)
+fit.cv
+```
+
+```{r}
+library(purrr)
 library(sparse.group.slope)
+n <- nrow(X)
+d <- ncol(X)
+L <- nlevels(y)
+
+idx <- sample(1:n, n)
+folds <- 10
+fold.size <- ceiling(n/folds)
+As <- seq(0.15, 0.01, -0.01)
+
+for (w in seq(0.01, 0.91, 0.1)) {
+  cvs <- rep(0, length(As))
+  all_results <- list()
+  Binits <- as.list(rep(0, folds))
+
+
+  for (j in 1:length(As)) {
+    A <- As[j]
+
+    lambda <- (1-w)*A*sapply(1:d, function(i)(sqrt(log(d*exp(1)/i)/n)))
+    alpha <- w*A*sapply(1:L, function(j)(sqrt(log(L*exp(1)/j)/n)))
+
+    fold <- function(i){
+      test.group <- fit.cv$cv.indices[[i]]
+      model <- sparse.group.slope::SparseGroupSLOPE(
+        X=X[-test.group,], y=diag(L)[y[-test.group],], eta=0.5, tol = 1e-4,
+        monotone=F, accelerated=T, lambda = lambda, alpha = alpha, BInit = Binits[[i]], #B
+        maxIter=50000, standardize=FALSE, minStepSize = 1e-5, stepSize = 0.001,
+        )
+      list(
+        B = model$coefficient,
+        A = A,
+        non_zeros = sum(model$coefficients != 0),
+        non_zero_groups = sum(apply(model$coefficients != 0, 1, any)),
+        iters = model$iterations,
+        error = mean(apply(predict.sgs(model, X[test.group,]), 1, which.max) != as.numeric(y[test.group]))
+      )
+    }
+
+    res <- lapply(1:folds, fold)
+    all_results <- append(all_results, res)
+    Binits <- map(res, pluck, "B")
+    iters <- unlist(map(res, pluck, "iters"))
+    cvs[j] <- mean(unlist(map(res, pluck, "error")))
+  }
+  print(paste(w, min(cvs)))
+}
 ```
