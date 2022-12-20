@@ -52,14 +52,14 @@ Rcpp::List SparseGroupSLOPE(
 
   if (X.isS4()) {
     if(X.inherits("dgCMatrix")) {
-      return mfista<arma::mat>(
+      return single_mfista<arma::mat>(
         family, reg, Rcpp::as<arma::sp_mat>(X), y, BInitMat, intercept, stepSize, eta, tol, maxIter,
         minStepSize, accelerated, monotone, saveData, min_val, standardize=standardize
       );
     }
     Rcpp::stop("unknown class of X");
   } else {
-    return mfista<arma::mat>(
+    return single_mfista<arma::mat>(
       family, reg, Rcpp::as<arma::mat>(X), y, BInitMat, intercept, stepSize, eta, tol, maxIter,
       minStepSize, accelerated, monotone, saveData, min_val, standardize=standardize
     );

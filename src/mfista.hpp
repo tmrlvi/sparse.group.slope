@@ -18,24 +18,25 @@ inline void standardizeMatrix(arma::sp_mat& X, arma::rowvec& scale) {
   }
 }
 
+template<typename C>
+struct mfista_result {
+  C B;
+  arma::rowvec b;
+  long iter;
+  double stepSize;
+};
+
 template<typename C, typename T, typename F, typename R>
-Rcpp::List mfista(
+mfista_result<C> mfista(
     F const &family, R const &reg, T X, arma::mat y, arma::mat BInit, bool intercept = true,
     double stepSize = 100, double eta = 0.9, double tol=1e-5, long maxIter = 1e5,
     double minStepSize=1e-10, bool accelerated = false, bool monotone = false,
-    bool saveData=false, const double min_val=1, bool standardize=true
+    const double min_val=1
 ){
   if (BInit.n_rows == 1 && BInit.n_cols == 1) {
     BInit = arma::zeros(X.n_cols, y.n_cols) + BInit(0,0);
   }
   
-  double sqrt_n = std::sqrt(X.n_rows);
-  arma::rowvec colScales(arma::sqrt(arma::sum(arma::square(X), 0)));
-  colScales = colScales.transform( [&](double val) { return (val < arma::datum::eps) ? 0.0 : sqrt_n / val; } );
-  if (standardize) {
-    //X = normalise(X, 2, 0)*sqrt_n;
-    standardizeMatrix(X, colScales);
-  }
   DPRINT(arma::size(X));
   DPRINT(arma::size(y));
   DPRINT(arma::size(BInit));
@@ -87,28 +88,6 @@ Rcpp::List mfista(
     }
     uprod.each_col() -= arma::max(uprod, 1);
 
-    // Backtracking
-    double primal = family.primal(vprod, y);
-    unsigned int k = 0;
-    while(family.primal(uprod, y)*inv_n_sqrt > primal*inv_n_sqrt +
-          arma::dot(arma::vectorise(grad), arma::vectorise(U - V)) + arma::dot(b_grad, b_u - b_v) +
-          1/(stepSize*2) * arma::accu(arma::square(arma::vectorise(U - V))) + 
-          arma::accu(arma::square(b_u - b_v)) && stepSize > minStepSize){
-      k++;
-      if (k % 100 == 0) {
-        Rcpp::checkUserInterrupt();
-      }
-      DPRINT(stepSize);
-      stepSize *= eta;
-      U = reg.prox(V - stepSize * grad, stepSize);
-      uprod = arma::conv_to<arma::mat>::from(X*U);
-      if (intercept){
-        b_u = b_v - stepSize * b_grad;
-        uprod.each_row() += b_u;
-      }
-      uprod.each_col() -= arma::max(uprod, 1);
-    }
-
     DPRINT(stepSize);
     if (accelerated){
       BPrev = B;
@@ -135,24 +114,50 @@ Rcpp::List mfista(
     vprod.each_row() += b_v;
     vprod.each_col() -= arma::max(vprod, 1);
   }
+  return {.B=B, .b=b, .iter=iter, .stepSize=stepSize};
+}
 
-  prod = arma::conv_to<arma::mat>::from(X*B);
-  prod.each_row() += b;
+
+template<typename C, typename T, typename F, typename R>
+Rcpp::List single_mfista(
+    F const &family, R const &reg, T X, arma::mat y, arma::mat BInit, bool intercept = true,
+    double stepSize = 100, double eta = 0.9, double tol=1e-5, long maxIter = 1e5,
+    double minStepSize=1e-10, bool accelerated = false, bool monotone = false,
+    bool saveData=false, const double min_val=1, bool standardize=true
+){
+  double sqrt_n = std::sqrt(X.n_rows);
+  const double inv_n_sqrt = 1./X.n_rows;
+  double tol_infeas = std::max(arma::datum::eps, tol*std::min(min_val,1.));
+
+  arma::rowvec colScales(arma::sqrt(arma::sum(arma::square(X), 0)));
+  colScales = colScales.transform( [&](double val) { return (val < arma::datum::eps) ? 0.0 : sqrt_n / val; } );
+  if (standardize) {
+    //X = normalise(X, 2, 0)*sqrt_n;
+    standardizeMatrix(X, colScales);
+  }
+
+  mfista_result<C> mfista_res = mfista<C>(
+    family, reg, X, y, BInit, intercept, stepSize, eta, tol, maxIter, minStepSize, accelerated, monotone,
+    min_val
+  );
+
+  arma::mat prod = arma::conv_to<arma::mat>::from(X*mfista_res.B);
+  prod.each_row() += mfista_res.b;
   prod.each_col() -= arma::max(prod, 1);
-  if (abs(family.dualgap(prod, y)*inv_n_sqrt + reg.evaluate(B)) > tol ||
-      reg.infeasibility(-inv_n_sqrt*(X_t*(family.linkinv(prod) - y))) > tol_infeas){
-    std::cerr << "Stopped before convergence. Dual gap: " << family.dualgap(prod, y)*inv_n_sqrt+ reg.evaluate(B)
-              << ", infeasibility: " << reg.infeasibility(-inv_n_sqrt*(X_t*(family.linkinv(prod) - y)))
-              << " (iterations: " << iter << ", last step size: " << stepSize << ")" << std::endl;
+  if (abs(family.dualgap(prod, y)*inv_n_sqrt + reg.evaluate(mfista_res.B)) > tol ||
+      reg.infeasibility(-inv_n_sqrt*(X.t()*(family.linkinv(prod) - y))) > tol_infeas){
+    std::cerr << "Stopped before convergence. Dual gap: " << family.dualgap(prod, y)*inv_n_sqrt+ reg.evaluate(mfista_res.B)
+              << ", infeasibility: " << reg.infeasibility(-inv_n_sqrt*(X.t()*(family.linkinv(prod) - y)))
+              << " (iterations: " << mfista_res.iter << ", last step size: " << mfista_res.stepSize << ")" << std::endl;
   }
   Rcpp::List res = Rcpp::List::create(
-    Rcpp::Named("coefficients") = arma::mat(B),
-    Rcpp::Named("intercepts") = b,
-    Rcpp::Named("final.loss") = family.primal(prod, y)*inv_n_sqrt + reg.evaluate(B),
-    Rcpp::Named("final.dualgap") = family.dualgap(prod, y)*inv_n_sqrt + reg.evaluate(B),
-    Rcpp::Named("final.infeasibility") = reg.infeasibility(X_t*(family.linkinv(prod) - y)*inv_n_sqrt),
-    Rcpp::Named("iterations") = iter,
-    Rcpp::Named("final.step.size") = stepSize,
+    Rcpp::Named("coefficients") = arma::mat(mfista_res.B),
+    Rcpp::Named("intercepts") = mfista_res.b,
+    Rcpp::Named("final.loss") = family.primal(prod, y)*inv_n_sqrt + reg.evaluate(mfista_res.B),
+    Rcpp::Named("final.dualgap") = family.dualgap(prod, y)*inv_n_sqrt + reg.evaluate(mfista_res.B),
+    Rcpp::Named("final.infeasibility") = reg.infeasibility(X.t()*(family.linkinv(prod) - y)*inv_n_sqrt),
+    Rcpp::Named("iterations") = mfista_res.iter,
+    Rcpp::Named("final.step.size") = mfista_res.stepSize,
     Rcpp::Named("standardize") = standardize,
     Rcpp::Named("col.scale") = colScales
   );

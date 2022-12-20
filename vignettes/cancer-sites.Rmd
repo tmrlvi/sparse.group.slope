@@ -11,6 +11,7 @@ vignette: >
 library(GEOquery)
 library(dplyr)
 library(stringr)
+options(error = quote(dump.frames()))
 knitr::opts_chunk$set(
   collapse = TRUE,
   comment = "#>"
@@ -47,30 +48,140 @@ y <- as.factor((pData(phenoData(selected)) %>%
 
 # Sparse Group Lasso
 ```{r}
-library(msgl)
-data(PrimaryCancers)
-X <- x
-y <- classes
-```
+msgl.fit.cv <- function(X, y, grid.alpha, grid.lambda, cv.indices) {
+    library(msgl)
+    Xorig <- X
+    X <- X[,!apply(X, 2, function(x){all(x == x[1])})]
+    cvs <- matrix(-1, length(grid.alpha), length(grid.lambda))
 
-```{r}
-indices <- fit.cv$cv.indices
-```
-
-```{r}
-#Do cross validation using 2 parallel units
-cl <- parallel::makeCluster(5)
-doParallel::registerDoParallel(cl)
-# Do 4-fold cross validation on a lambda sequence of length 100.
-# The sequence is decreasing from the data derived lambda.max to 0.2*lambda.max
-for (w in seq(0., 0.2, 0.01)) {
-  fit.cv <- msgl::cv(X, y, fold = 10, lambda = 0.01, alpha=w, use_parallel = TRUE, standardize = TRUE, cv.indices = indices)
-  print(paste(w, min(Err(fit.cv))))
+    cl <- parallel::makeCluster(5)
+    doParallel::registerDoParallel(cl)
+    for (i in 1:length(grid.alpha)) {
+        model <- cv(
+            X, y, fold = length(cv.indices), lambda = grid.lambda, 
+            alpha = grid.alpha[i], use_parallel = TRUE, standardize = TRUE, 
+            cv.indices = cv.indices
+        )
+        cvs[i,] <- Err(model)
+    }
+    parallel::stopCluster(cl)
+    return(cvs)
 }
-parallel::stopCluster(cl)
-# Print information about models
-# and cross validation errors (estimated expected generalization error)
-fit.cv
+
+msgl.fit_evaluate <- function(Xtrain, ytrain, Xtest, ytest, alpha, lambda) {
+  library(msgl)
+  Xorig <- Xtrain
+  Xtest <- Xtest[,!apply(Xtrain, 2, function(x){all(x == x[1])})]
+  Xtrain <- Xtrain[,!apply(Xtrain, 2, function(x){all(x == x[1])})]
+  model <- msgl::fit(
+    Xtrain, ytrain, alpha = alpha, lambda = c(lambda, lambda), 
+    standardize=TRUE, d=2
+  )
+  preds <- predict(model, Xtest)
+  # Coefficients without the intercept
+  B <- models(model)[[2]][, -1]
+  return(list(
+    err = mean(preds$classes[,2] != ytest),
+    parameters = sum(B != 0),
+    features = sum(colSums(B^2) != 0)
+  ))
+}
+```
+
+```{r}
+msgl.result <- sparse.group.slope::compare(
+  X, y, grid.alpha = seq(0.1, 0.001, -0.01), 
+  grid.lambda = seq(0.02, 0.001, -0.001), folds=10, n.boostrap = 10,
+  model.cv = msgl.fit.cv, model.fit_evaluate = msgl.fit_evaluate
+)
+```
+
+# Sparse Group SLOPE
+```{r}
+fit.cv <- function(X, y, grid.alpha, grid.lambda, cv.indices) {
+    library(purrr)
+    library(sparse.group.slope)
+    cvs <- matrix(-1, length(grid.alpha), length(grid.lambda))
+    n <- nrow(X)
+    d <- ncol(X)
+    L <- nlevels(y)
+
+    Binits <- as.vector(rep(0, length(cv.indices)), "list")
+    for (i in seq_along(grid.alpha)) {
+        alpha <- grid.alpha[i]
+        for (j in seq_along(grid.lambda)) {
+            A <- grid.lambda[j]
+            lambda <- alpha * A * sapply(
+                1:d, function(i) (sqrt(log(d * exp(1) / i) / n))
+            )
+            kappa <- (1 - alpha) * A * sapply(
+                1:L, function(j) (sqrt(log(L * exp(1) / j) / n ))
+            )
+            fold <- function(i){
+                test.group <- cv.indices[[i]]
+                model <- sparse.group.slope::SparseGroupSLOPE(
+                    X = X[-test.group, ], y = diag(L)[y[-test.group], ],
+                    eta = 0.5, tol = 1e-4, monotone = F, accelerated = T,
+                    lambda = lambda, alpha = kappa, BInit = Binits[[i]],
+                    maxIter = 100000, standardize = FALSE, minStepSize = 1e-5,
+                    stepSize = 0.001,
+                )
+
+                list(
+                    B = model$coefficient,
+                    A = A,
+                    non_zeros = sum(model$coefficients != 0),
+                    non_zero_groups = sum(apply(model$coefficients != 0, 1, any)),
+                    iters = model$iterations,
+                    error = mean(apply(predict.sgs(model, X[test.group,]), 1, which.max) != as.numeric(y[test.group]))
+                )
+            }
+
+            res <- lapply(1:length(cv.indices), fold)
+            cvs[i, j] <- mean(unlist(map(res, pluck, "error")))
+        }
+    }
+    return(cvs)
+}
+```
+
+```{r}
+sgs.fit_evaluate <- function(Xtrain, ytrain, Xtest, ytest, alpha, lambda) {
+  library(sparse.group.slope)
+  A <- lambda
+  lambda <- alpha * A * sapply(
+      1:d, function(i) (sqrt(log(d * exp(1) / i) / n))
+  )
+  kappa <- (1 - alpha) * A * sapply(
+      1:L, function(j) (sqrt(log(L * exp(1) / j) / n ))
+  )
+  model <- sparse.group.slope::SparseGroupSLOPE(
+      X = Xtrain, y = diag(L)[ytrain, ],
+      eta = 0.5, tol = 1e-4, monotone = F, accelerated = T,
+      lambda = lambda, alpha = kappa, BInit = Binits[[i]],
+      maxIter = 100000, standardize = FALSE, minStepSize = 1e-5,
+      stepSize = 0.001,
+  )
+
+  return(list(
+    err = mean(
+      apply(predict.sgs(model, Xtest), 1, which.max) != as.numeric(ytest)
+    ),
+    parameters = sum(model$coefficients != 0),
+    features = sum(colSums(model$coefficients^2) != 0)
+  ))
+}
+```
+
+```{r}
+sgs.cvs <- fit.cv(
+  X, y, grid.alpha = seq(0.91, 0.01, -0.05),
+  grid.lambda = seq(0.15, 0.01, -0.01),
+  cv.indices = msgl.result$indices
+)
+```
+
+```{r}
 ```
 
 ```{r}
