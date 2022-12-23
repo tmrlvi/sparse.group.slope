@@ -18,12 +18,6 @@ knitr::opts_chunk$set(
 )
 ```
 
-```{r, include=FALSE}
-Sys.setenv(
-  MKL_THREADING_LAYER="GNU",
-  OPENBLAS_NUM_THREADS=5
-)
-```
 
 # Process Data
 
@@ -58,12 +52,14 @@ y <- as.factor((pData(phenoData(selected)) %>%
 ```{r}
 library(caret)
 
-trControl <- trainControl(## 10-fold CV
-                           method = "repeatedcv",
-                           number = 10,
-                           ## repeated ten times
-                           repeats = 10,
-                           verboseIter=TRUE)
+cvRounds <- 10
+# Estimating error in the final model
+repeats <- 10
+
+trControl <- trainControl(method = "cv", number = cvRounds)
+
+repeats <- createDataPartition(y, p = .75, list = FALSE, times=repeats)
+result <- data.frame(row.names=1:repeats)
 ```
 ## Linear
 
@@ -105,14 +101,20 @@ library(doParallel)
 cl <- makePSOCKcluster(5)
 registerDoParallel(cl)
 
-sglmod <- train(X, y, 
-                method = sgl, 
-                metric = "Accuracy",
-                tuneGrid = expand.grid(
-                  lambda= seq(0.02, 0.001, -0.001),
-                  alpha= seq(0.1, 0.001, -0.01),
-                ),
-                trControl = trControl)
+result["sparseGroupLasso"] <- NA
+for (i in 1:ncol(repeats)) {
+  idx <- repeats[,i]
+  sglmod <- train(X[idx,], y[idx], 
+                  method = sgl, 
+                  metric = "Accuracy",
+                  tuneGrid = expand.grid(
+                    lambda= seq(0.02, 0.001, -0.001),
+                    alpha= seq(0.1, 0.001, -0.01),
+                  ),
+                  trControl = trControl)
+  pred <- predict(sglmod, X[-idx,])
+  result[i,"sparseGroupLasso"] <- mean(pred != y[-idx])
+}
 
 stopCluster(cl)
 ```
@@ -155,13 +157,19 @@ library(doParallel)
 cl <- makePSOCKcluster(5)
 registerDoParallel(cl)
 
-glmod <- train(X, y, 
-                method = gl, 
-                metric = "Accuracy",
-                tuneGrid = expand.grid(
-                  lambda= seq(0.91, 0.01, -0.3),
-                ),
-                trControl = trControl)
+result["groupLasso"] <- NA
+for (i in 1:ncol(repeats)) {
+  idx <- repeats[,i]
+  glmod <- train(X[idx,], y[idx],
+                  method = gl, 
+                  metric = "Accuracy",
+                  tuneGrid = expand.grid(
+                    lambda= seq(0.91, 0.01, -0.3),
+                  ),
+                  trControl = trControl)
+  pred <- predict(glmod, X[-idx,])
+  result[i,"groupLasso"] <- mean(pred != y[-idx])
+}
 
 stopCluster(cl)
 ```
@@ -192,17 +200,20 @@ sgs <- list(
     kappa <- (1 - param$alpha) * param$lambda * sapply(
       1:L, function(j) (sqrt(log(L * exp(1) / j) / n ))
     )
-    sparse.group.slope::SparseGroupSLOPE(
-      as.matrix(x), y = diag(L)[y,],
-      eta = 0.5, tol = 1e-4, monotone = F, accelerated = T,
-      lambda = lambda, alpha = kappa,
-      maxIter = param$maxIter, standardize = FALSE, 
-      minStepSize = 1e-5, stepSize = param$stepSize, BInit=0, ...
+    list(
+      model = sparse.group.slope::SparseGroupSLOPE(
+                as.matrix(x), y = diag(L)[y,],
+                eta = 0.5, tol = 1e-4, monotone = F, accelerated = T,
+                lambda = lambda, alpha = kappa,
+                maxIter = param$maxIter, standardize = FALSE, 
+                minStepSize = 1e-5, stepSize = param$stepSize, BInit=0, ...
+              ),
+      levels=levels(y)
     )
  },
  predict = function(modelFit, newdata, preProc, submodels) {
    library(sparse.group.slope)
-   apply(predict.sgs(modelFit, as.matrix(newdata)), 1, which.max)
+   factor(modelFit$levels[apply(predict.sgs(modelFit$model, as.matrix(newdata)), 1, which.max)])
   },
   prob = function(modelFit, newdata, preProc, submodels) {
    stop("need to check implementation")
@@ -216,19 +227,25 @@ sgs <- list(
 
 ```{r}
 library(doParallel)
-cl <- makePSOCKcluster(5)
+cl <- makePSOCKcluster(8)
 registerDoParallel(cl)
 
-sgsmod <- train(X, y, 
-                method = sgs, 
-                metric = "Accuracy",
-                tuneGrid = expand.grid(
-                  lambda= seq(0.91, 0.01, -0.3),
-                  alpha= seq(0.15, 0.01, -0.05),
-                  maxIter = c(10000),
-                  stepSize = c(0.001)
-                ),
-                trControl = trControl)
+result["sgs"] <- NA
+for (i in 1:ncol(repeats)) {
+  idx <- repeats[,i]
+  sgsmod <- train(X[idx,], y[idx], 
+                  method = sgs, 
+                  metric = "Accuracy",
+                  tuneGrid = expand.grid(
+                    lambda= seq(0.91, 0.01, -0.3),
+                    alpha= seq(0.15, 0.01, -0.05),
+                    maxIter = c(100),
+                    stepSize = c(0.001)
+                  ),
+                  trControl = trControl)
+  pred <- predict(sgsmod, X[-idx,])
+  result[i,"sgs"] <- mean(pred != y[-idx])
+}
 
 stopCluster(cl)
 ```
@@ -237,47 +254,43 @@ stopCluster(cl)
 ### XGboost
 
 ```{r}
-tuneGrid <- expand.grid(nrounds = c(50, 100, 200, 1000),
-                        max_depth = c(3, 5, 10),
-                        eta = c(0.01, 0.05, 0.1),
-                        gamma = c(0.01, 0.1),
-                        colsample_bytree = c(0.75, 1.0),
-                        min_child_weight = 0,
-                        subsample = c(0.5, 1.0)
-          )
-
-xgbmod <- train(X, y,
-                 method = "xgbTree", 
-                 trControl = trControl,
-                 metric = "Accuracy",
-                 #tuneGrid = tuneGrid,
-                 verbosity = 0
-                 )
+result["xgboost"] <- NA
+for (i in 1:ncol(repeats)) {
+  idx <- repeats[,i]
+  xgbmod <- train(X[idx,], y[idx],
+                   method = "xgbTree", 
+                   trControl = trControl,
+                   metric = "Accuracy",
+                   #tuneGrid = tuneGrid,
+                   verbosity = 0
+                   )
+  pred <- predict(xgbmod, X[-idx,])
+  result[i,"xgboost"] <- mean(pred != y[-idx])
+}
 ```
 
 ### Random Forest
 
 ```{r}
-trmod <- train(X, y,
-                 method = "tr", 
-                 trControl = trControl,
-                 metric = "Accuracy",
-                 #tuneGrid = tuneGrid,
-                 verbosity = 0
-                 )
+result["randomForest"] <- NA
+for (i in 1:ncol(repeats)) {
+  idx <- repeats[,i]
+  rfmod <- train(X[idx,], y[idx],
+                   method = "rf", 
+                   trControl = trControl,
+                   metric = "Accuracy",
+                   #tuneGrid = tuneGrid,
+                   verbosity = 0
+                   )
+  pred <- predict(trmod, X[-idx,])
+  result[i,"randomForest"] <- mean(pred != y[-idx,])
+}
 ```
 
 ## Summary
 
 ```{r}
-res <- resamples(list(
-  sparseGroupSLOPE = sgsmod, 
-  groupSLOPE = gsmod, 
-  sparseGroupLasso = sglmod, 
-  groupLasso = glmod, 
-  xgboost = xgbmod, 
-  randomForest = trmod
-  ))
-summary(res)
+print("Mean", colMeans(result))
+print("Std:", mean(sweep(result, 2, colMeans(result), "-")^2))
 ```
 
