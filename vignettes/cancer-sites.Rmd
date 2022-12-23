@@ -18,6 +18,13 @@ knitr::opts_chunk$set(
 )
 ```
 
+```{r, include=FALSE}
+Sys.setenv(
+  MKL_THREADING_LAYER="GNU",
+  OPENBLAS_NUM_THREADS=5
+)
+```
+
 # Process Data
 
 ```{r}
@@ -46,191 +53,231 @@ y <- as.factor((pData(phenoData(selected)) %>%
   select(class))$class)
 ```
 
-# Sparse Group Lasso
+# Models
+
 ```{r}
-msgl.fit.cv <- function(X, y, grid.alpha, grid.lambda, cv.indices) {
-    library(msgl)
-    Xorig <- X
-    X <- X[,!apply(X, 2, function(x){all(x == x[1])})]
-    cvs <- matrix(-1, length(grid.alpha), length(grid.lambda))
+library(caret)
 
-    cl <- parallel::makeCluster(5)
-    doParallel::registerDoParallel(cl)
-    for (i in 1:length(grid.alpha)) {
-        model <- cv(
-            X, y, fold = length(cv.indices), lambda = grid.lambda, 
-            alpha = grid.alpha[i], use_parallel = TRUE, standardize = TRUE, 
-            cv.indices = cv.indices
-        )
-        cvs[i,] <- Err(model)
-    }
-    parallel::stopCluster(cl)
-    return(cvs)
-}
+trControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 10,
+                           verboseIter=TRUE)
+```
+## Linear
 
-msgl.fit_evaluate <- function(Xtrain, ytrain, Xtest, ytest, alpha, lambda) {
-  library(msgl)
-  Xorig <- Xtrain
-  Xtest <- Xtest[,!apply(Xtrain, 2, function(x){all(x == x[1])})]
-  Xtrain <- Xtrain[,!apply(Xtrain, 2, function(x){all(x == x[1])})]
-  model <- msgl::fit(
-    Xtrain, ytrain, alpha = alpha, lambda = c(lambda, lambda), 
+### Sparse Group LASSO
+
+```{r}
+sgl <- list(
+ type="Classification",
+ library="msgl",
+ loop=NULL,
+ parameters = data.frame(
+   parameter=c("lambda", "alpha"),
+   class = rep("numeric", 2),
+   label = c("Regularization", "Balance")
+ ),
+ grid = function(x, y, len=NULL, search="grid") {
+    stop("must provide tuneGrid")
+ },
+ fit = function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+   library(msgl)
+   model <- msgl::fit(
+    x, y, alpha = param$alpha, lambda = c(param$lambda, param$lambda), 
     standardize=TRUE, d=2
   )
-  preds <- predict(model, Xtest)
-  # Coefficients without the intercept
-  B <- models(model)[[2]][, -1]
-  return(list(
-    err = mean(preds$classes[,2] != ytest),
-    parameters = sum(B != 0),
-    features = sum(colSums(B^2) != 0)
-  ))
-}
-```
-
-```{r}
-msgl.result <- sparse.group.slope::compare(
-  X, y, grid.alpha = seq(0.1, 0.001, -0.01), 
-  grid.lambda = seq(0.02, 0.001, -0.001), folds=10, n.boostrap = 10,
-  model.cv = msgl.fit.cv, model.fit_evaluate = msgl.fit_evaluate
+ },
+ predict = function(modelFit, newdata, preProc, submodels) {
+   library(msgl)
+   predict(modelFit, newdata)$classes[,2]
+  },
+  prob = function(modelFit, newdata, preProc, submodels) {
+   stop("not implemented")
+ },
+ levels = function(x) {levels(x)}
 )
 ```
 
-# Sparse Group SLOPE
 ```{r}
-fit.cv <- function(X, y, grid.alpha, grid.lambda, cv.indices) {
-    library(purrr)
-    library(sparse.group.slope)
-    cvs <- matrix(-1, length(grid.alpha), length(grid.lambda))
-    n <- nrow(X)
-    d <- ncol(X)
-    L <- nlevels(y)
+library(doParallel)
+cl <- makePSOCKcluster(5)
+registerDoParallel(cl)
 
-    Binits <- as.vector(rep(0, length(cv.indices)), "list")
-    for (i in seq_along(grid.alpha)) {
-        alpha <- grid.alpha[i]
-        for (j in seq_along(grid.lambda)) {
-            A <- grid.lambda[j]
-            lambda <- alpha * A * sapply(
-                1:d, function(i) (sqrt(log(d * exp(1) / i) / n))
-            )
-            kappa <- (1 - alpha) * A * sapply(
-                1:L, function(j) (sqrt(log(L * exp(1) / j) / n ))
-            )
-            fold <- function(i){
-                test.group <- cv.indices[[i]]
-                model <- sparse.group.slope::SparseGroupSLOPE(
-                    X = X[-test.group, ], y = diag(L)[y[-test.group], ],
-                    eta = 0.5, tol = 1e-4, monotone = F, accelerated = T,
-                    lambda = lambda, alpha = kappa, BInit = Binits[[i]],
-                    maxIter = 100000, standardize = FALSE, minStepSize = 1e-5,
-                    stepSize = 0.001,
-                )
+sglmod <- train(X, y, 
+                method = sgl, 
+                metric = "Accuracy",
+                tuneGrid = expand.grid(
+                  lambda= seq(0.02, 0.001, -0.001),
+                  alpha= seq(0.1, 0.001, -0.01),
+                ),
+                trControl = trControl)
 
-                list(
-                    B = model$coefficient,
-                    A = A,
-                    non_zeros = sum(model$coefficients != 0),
-                    non_zero_groups = sum(apply(model$coefficients != 0, 1, any)),
-                    iters = model$iterations,
-                    error = mean(apply(predict.sgs(model, X[test.group,]), 1, which.max) != as.numeric(y[test.group]))
-                )
-            }
+stopCluster(cl)
+```
 
-            res <- lapply(1:length(cv.indices), fold)
-            cvs[i, j] <- mean(unlist(map(res, pluck, "error")))
-        }
-    }
-    return(cvs)
-}
+### Group LASSO
+
+```{r}
+gl <- list(
+ type="Classification",
+ library="msgl",
+ loop=NULL,
+ parameters = data.frame(
+   parameter=c("lambda"),
+   class = rep("numeric", 1),
+   label = c("Regularization")
+ ),
+ grid = function(x, y, len=NULL, search="grid") {
+    stop("must provide tuneGrid")
+ },
+ fit = function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+   library(msgl)
+   model <- msgl::fit(
+    x, y, alpha = 1, lambda = c(param$lambda, param$lambda), 
+    standardize=TRUE, d=2
+  )
+ },
+ predict = function(modelFit, newdata, preProc, submodels) {
+   library(msgl)
+   predict(modelFit, newdata)$classes[,2]
+  },
+  prob = function(modelFit, newdata, preProc, submodels) {
+   stop("not implemented")
+ },
+ levels = function(x) {levels(x)}
+)
 ```
 
 ```{r}
-sgs.fit_evaluate <- function(Xtrain, ytrain, Xtest, ytest, alpha, lambda) {
-  library(sparse.group.slope)
-  A <- lambda
-  lambda <- alpha * A * sapply(
+library(doParallel)
+cl <- makePSOCKcluster(5)
+registerDoParallel(cl)
+
+glmod <- train(X, y, 
+                method = gl, 
+                metric = "Accuracy",
+                tuneGrid = expand.grid(
+                  lambda= seq(0.91, 0.01, -0.3),
+                ),
+                trControl = trControl)
+
+stopCluster(cl)
+```
+
+### Sparse Group SLOPE
+
+
+```{r}
+sgs <- list(
+ type="Classification",
+ library="sparse.group.slope",
+ loop=NULL,
+ parameters = data.frame(
+   parameter=c("lambda", "alpha", "maxIter", "stepSize"),
+   class = rep("numeric", 4),
+   label = c("Regularization", "Balance", "Iterations", "stepSize")
+ ),
+ grid = function(x, y, len=NULL, search="grid") {
+    stop("must provide tuneGrid")
+ },
+ fit = function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+   n <- nrow(x)
+   d <- ncol(x)
+   L <- nlevels(y)
+   lambda <- param$alpha * param$lambda * sapply(
       1:d, function(i) (sqrt(log(d * exp(1) / i) / n))
-  )
-  kappa <- (1 - alpha) * A * sapply(
+    )
+    kappa <- (1 - param$alpha) * param$lambda * sapply(
       1:L, function(j) (sqrt(log(L * exp(1) / j) / n ))
-  )
-  model <- sparse.group.slope::SparseGroupSLOPE(
-      X = Xtrain, y = diag(L)[ytrain, ],
+    )
+    sparse.group.slope::SparseGroupSLOPE(
+      as.matrix(x), y = diag(L)[y,],
       eta = 0.5, tol = 1e-4, monotone = F, accelerated = T,
-      lambda = lambda, alpha = kappa, BInit = Binits[[i]],
-      maxIter = 100000, standardize = FALSE, minStepSize = 1e-5,
-      stepSize = 0.001,
-  )
-
-  return(list(
-    err = mean(
-      apply(predict.sgs(model, Xtest), 1, which.max) != as.numeric(ytest)
-    ),
-    parameters = sum(model$coefficients != 0),
-    features = sum(colSums(model$coefficients^2) != 0)
-  ))
-}
-```
-
-```{r}
-sgs.cvs <- fit.cv(
-  X, y, grid.alpha = seq(0.91, 0.01, -0.05),
-  grid.lambda = seq(0.15, 0.01, -0.01),
-  cv.indices = msgl.result$indices
+      lambda = lambda, alpha = kappa,
+      maxIter = param$maxIter, standardize = FALSE, 
+      minStepSize = 1e-5, stepSize = param$stepSize, BInit=0, ...
+    )
+ },
+ predict = function(modelFit, newdata, preProc, submodels) {
+   library(sparse.group.slope)
+   apply(predict.sgs(modelFit, as.matrix(newdata)), 1, which.max)
+  },
+  prob = function(modelFit, newdata, preProc, submodels) {
+   stop("need to check implementation")
+   p <- exp(predict.sgs(modelFit, as.matrix(newdata)))
+   sweep(p, 1, colSums(p), '/')
+ },
+ levels = function(x) {levels(x)}
 )
 ```
 
-```{r}
-```
 
 ```{r}
-library(purrr)
-library(sparse.group.slope)
-n <- nrow(X)
-d <- ncol(X)
-L <- nlevels(y)
+library(doParallel)
+cl <- makePSOCKcluster(5)
+registerDoParallel(cl)
 
-idx <- sample(1:n, n)
-folds <- 10
-fold.size <- ceiling(n/folds)
-As <- seq(0.15, 0.01, -0.01)
+sgsmod <- train(X, y, 
+                method = sgs, 
+                metric = "Accuracy",
+                tuneGrid = expand.grid(
+                  lambda= seq(0.91, 0.01, -0.3),
+                  alpha= seq(0.15, 0.01, -0.05),
+                  maxIter = c(10000),
+                  stepSize = c(0.001)
+                ),
+                trControl = trControl)
 
-for (w in seq(0.01, 0.91, 0.1)) {
-  cvs <- rep(0, length(As))
-  all_results <- list()
-  Binits <- as.list(rep(0, folds))
-
-
-  for (j in 1:length(As)) {
-    A <- As[j]
-
-    lambda <- (1-w)*A*sapply(1:d, function(i)(sqrt(log(d*exp(1)/i)/n)))
-    alpha <- w*A*sapply(1:L, function(j)(sqrt(log(L*exp(1)/j)/n)))
-
-    fold <- function(i){
-      test.group <- fit.cv$cv.indices[[i]]
-      model <- sparse.group.slope::SparseGroupSLOPE(
-        X=X[-test.group,], y=diag(L)[y[-test.group],], eta=0.5, tol = 1e-4,
-        monotone=F, accelerated=T, lambda = lambda, alpha = alpha, BInit = Binits[[i]], #B
-        maxIter=50000, standardize=FALSE, minStepSize = 1e-5, stepSize = 0.001,
-        )
-      list(
-        B = model$coefficient,
-        A = A,
-        non_zeros = sum(model$coefficients != 0),
-        non_zero_groups = sum(apply(model$coefficients != 0, 1, any)),
-        iters = model$iterations,
-        error = mean(apply(predict.sgs(model, X[test.group,]), 1, which.max) != as.numeric(y[test.group]))
-      )
-    }
-
-    res <- lapply(1:folds, fold)
-    all_results <- append(all_results, res)
-    Binits <- map(res, pluck, "B")
-    iters <- unlist(map(res, pluck, "iters"))
-    cvs[j] <- mean(unlist(map(res, pluck, "error")))
-  }
-  print(paste(w, min(cvs)))
-}
+stopCluster(cl)
 ```
+## Trees
+
+### XGboost
+
+```{r}
+tuneGrid <- expand.grid(nrounds = c(50, 100, 200, 1000),
+                        max_depth = c(3, 5, 10),
+                        eta = c(0.01, 0.05, 0.1),
+                        gamma = c(0.01, 0.1),
+                        colsample_bytree = c(0.75, 1.0),
+                        min_child_weight = 0,
+                        subsample = c(0.5, 1.0)
+          )
+
+xgbmod <- train(X, y,
+                 method = "xgbTree", 
+                 trControl = trControl,
+                 metric = "Accuracy",
+                 #tuneGrid = tuneGrid,
+                 verbosity = 0
+                 )
+```
+
+### Random Forest
+
+```{r}
+trmod <- train(X, y,
+                 method = "tr", 
+                 trControl = trControl,
+                 metric = "Accuracy",
+                 #tuneGrid = tuneGrid,
+                 verbosity = 0
+                 )
+```
+
+## Summary
+
+```{r}
+res <- resamples(list(
+  sparseGroupSLOPE = sgsmod, 
+  groupSLOPE = gsmod, 
+  sparseGroupLasso = sglmod, 
+  groupLasso = glmod, 
+  xgboost = xgbmod, 
+  randomForest = trmod
+  ))
+summary(res)
+```
+
